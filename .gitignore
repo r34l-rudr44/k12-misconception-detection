@@ -1,0 +1,23 @@
+# competition data and everything the scripts write
+data/
+work/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# secrets and local settings
+.env
+.env.*
+kaggle.json
+
+# editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
