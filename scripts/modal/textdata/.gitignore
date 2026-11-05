@@ -1,0 +1,4 @@
+# Generated inputs (text bundles, row selections, pseudo-labelled sets). They are derived from the competition data,
+# so they are not committed; the folder is kept because it is shipped to the Modal containers.
+*
+!.gitignore

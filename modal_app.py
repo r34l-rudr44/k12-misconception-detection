@@ -5,22 +5,23 @@
     merge_adapter   CPU   merge the LoRA adapter into the base weights (vLLM serves merged models)
     vllm_run        GPU   vLLM inference with the merged model: transcription (the "reader") and direct diagnosis
     infer_vlm       GPU   the same diagnosis with transformers beam search (slower; kept for small holdouts)
+    train_text      GPU   Qwen3-8B + LoRA + classification head on the transcribed text, one fold per call
     pull / download       copy the small result files of a run to work/<run>/
 
 Usage:
     modal deploy modal_app.py
-    python scripts/modal_spawn.py spawn train_vlm run=v1
+    python scripts/modal_spawn.py spawn train_text run=t1 fold=0
     python scripts/modal_spawn.py poll <call id>
-    modal run modal_app.py::download --run v1
+    modal run modal_app.py::download --run t1
 
 Needs the Modal secret `huggingface` (HF_TOKEN of an account that accepted the dataset's terms). Outputs go to
 /models/runs/<run> on the volume `k12-models`. The folder scripts/modal/ is copied into the images at deploy time, so
-redeploy after changing code.
+redeploy after changing code or scripts/modal/textdata/.
 
 Every function has a hard timeout.
 
-Environment variables read at deploy time: K12_GPU (default A10G), K12_BASE_MODEL (the VLM) and K12_TRAIN_TIMEOUT
-(seconds).
+Environment variables read at deploy time: K12_GPU (default A10G), K12_BASE_MODEL (the VLM), K12_TRAIN_TIMEOUT and
+K12_TEXT_TIMEOUT (seconds).
 """
 
 import os
@@ -330,3 +331,61 @@ def download(run: str = "v1"):
     for k, v in files.items():
         open(f"work/{run}/{k}", "w", encoding="utf-8").write(v)
         print("wrote", f"work/{run}/{k}", len(v))
+
+
+@app.function(
+    image=gpu_image,
+    gpu=GPU,
+    volumes={"/models": MODEL_VOL},
+    timeout=int(os.environ.get("K12_TEXT_TIMEOUT", 3600)),
+    memory=32768,
+)
+def train_text(
+    run: str = "t1",
+    fold: int = 0,
+    base: str = "Qwen/Qwen3-8B",
+    epochs: float = 2.0,
+    lr: float = 2e-4,
+    lora_r: int = 16,
+    batch: int = 4,
+    accum: int = 2,
+    max_len: int = 640,
+    p_gold: float = 0.25,
+    p_pub: float = 0.25,
+    limit: int = 0,
+    skip_test: bool = False,
+    seed: int = 42,
+    tag: str = "",
+):
+    """Text-only Qwen3 + LoRA + classification head, one fold per call (fold = -1 trains on all rows).
+
+    p_gold / p_pub = probability that a training row shows the human transcription / the public OCR instead of our
+    reader's OCR, so the model sees the same kind of noisy text it gets at test time.
+    """
+    import sys
+
+    sys.path.insert(0, "/root/k12")
+    import text_cls
+
+    try:  # the adapter and every prediction file are committed as they are written, so a late failure keeps them
+        return text_cls.main(
+            base=base,
+            data_dir="/root/k12/textdata",
+            out=f"/models/runs/{run}",
+            fold=fold,
+            epochs=epochs,
+            lr=lr,
+            lora_r=lora_r,
+            batch=batch,
+            accum=accum,
+            max_len=max_len,
+            p_gold=p_gold,
+            p_pub=p_pub,
+            limit=limit,
+            skip_test=skip_test,
+            seed=seed,
+            tag=tag,
+            on_save=MODEL_VOL.commit,
+        )
+    finally:
+        MODEL_VOL.commit()
