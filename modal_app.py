@@ -10,9 +10,9 @@
 
 Usage:
     modal deploy modal_app.py
-    python scripts/modal_spawn.py spawn train_text run=t1 fold=0
+    python scripts/modal_spawn.py spawn train_text run=p2 fold=0 extra=pseudo_mix
     python scripts/modal_spawn.py poll <call id>
-    modal run modal_app.py::download --run t1
+    modal run modal_app.py::download --run p2
 
 Needs the Modal secret `huggingface` (HF_TOKEN of an account that accepted the dataset's terms). Outputs go to
 /models/runs/<run> on the volume `k12-models`. The folder scripts/modal/ is copied into the images at deploy time, so
@@ -353,12 +353,14 @@ def train_text(
     p_gold: float = 0.25,
     p_pub: float = 0.25,
     limit: int = 0,
+    extra: str = "",
     skip_test: bool = False,
     seed: int = 42,
     tag: str = "",
 ):
     """Text-only Qwen3 + LoRA + classification head, one fold per call (fold = -1 trains on all rows).
 
+    extra = name of a pseudo-labelled set in scripts/modal/textdata, added to the training rows.
     p_gold / p_pub = probability that a training row shows the human transcription / the public OCR instead of our
     reader's OCR, so the model sees the same kind of noisy text it gets at test time.
     """
@@ -382,6 +384,7 @@ def train_text(
             p_gold=p_gold,
             p_pub=p_pub,
             limit=limit,
+            extra=extra,
             skip_test=skip_test,
             seed=seed,
             tag=tag,

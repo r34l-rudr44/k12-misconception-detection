@@ -83,6 +83,7 @@ def main(
     p_pub=0.25,
     limit=0,
     tag="",
+    extra="",
     skip_test=False,
     infer_len=1024,
     on_save=None,
@@ -104,6 +105,11 @@ def main(
     ci = {c: i for i, c in enumerate(classes)}
     trn = tr[tr.fold != fold].reset_index(drop=True)
     val = tr[tr.fold == fold].reset_index(drop=True)
+    if extra:  # pseudo-labelled rows (Sonnet label + transcript), training only
+        ex = pd.read_csv(f"{data_dir}/{extra}.csv")
+        ex = ex[ex.root_code.isin(ci)]
+        trn = pd.concat([trn, ex], ignore_index=True)
+        print(f"extra {extra}: +{len(ex)} rows", flush=True)
     if limit:
         trn, val, te = trn.head(limit), val.head(min(limit, len(val))), te.head(limit)
     tok = load_tok(base)
