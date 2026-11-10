@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+import re
 import time
 
 import numpy as np
@@ -27,6 +28,17 @@ def _s(x):
     return x if isinstance(x, str) else ""
 
 
+_LINE = re.compile(r"^\s*L\d+\s*\|")
+_META = re.compile(r"\[student answered|<\s*/?\s*mis", re.I)
+
+
+def clean_gold(x):
+    """Gold transcriptions sometimes carry annotator notes ("[student answered the question correctly]", <misconseption>
+    tags) that give the label away and never occur in test OCR. Keep only real 'L<n> | ...' lines without such notes."""
+    keep = [l for l in _s(x).splitlines() if _LINE.match(l) and not _META.search(l)]
+    return "\n".join(keep)
+
+
 def map3(P, y):
     top = np.argsort(-P, 1)[:, :3]
     return float(np.mean((top == y[:, None]) @ np.array([1, 1 / 2, 1 / 3])))
@@ -38,6 +50,7 @@ def load_tok(base):
     tok = AutoTokenizer.from_pretrained(base)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    tok.truncation_side = "left"  # the student work and its final answer are at the END of the text: never cut them
     return tok
 
 
@@ -65,6 +78,21 @@ def predict_probs(model, tok, texts, n_classes, max_len, bs=16):
             bs = max(1, bs // 2)
             print(f"OOM at inference -> batch {bs}", flush=True)
     return P
+
+
+def sanity(P, classes, name):
+    """Cheap guard against a silently broken model (e.g. head not restored -> near-uniform probabilities)."""
+    top = P.argmax(1)
+    none = float((top == classes.index("NONE")).mean())
+    conf = float(P.max(1).mean())
+    print(
+        f"SANITY {name}: mean max-prob {conf:.3f} | NONE top-1 share {none:.3f} | distinct top-1 codes {len(set(top))}",
+        flush=True,
+    )
+    assert len(P) < 500 or (conf > 0.25 and 0.1 < none < 0.7 and len(set(top)) >= 15), (
+        f"{name}: predictions look broken"
+    )
+    return {"conf": round(conf, 3), "none_share": round(none, 3)}
 
 
 def main(
@@ -103,6 +131,7 @@ def main(
     te = pd.read_csv(f"{data_dir}/text_test.csv")
     classes = json.load(open(f"{data_dir}/classes.json"))
     ci = {c: i for i, c in enumerate(classes)}
+    tr["gold"] = tr.gold.map(clean_gold)
     trn = tr[tr.fold != fold].reset_index(drop=True)
     val = tr[tr.fold == fold].reset_index(drop=True)
     if extra:  # pseudo-labelled rows (Sonnet label + transcript), training only
@@ -218,8 +247,58 @@ def main(
     if not skip_test:
         for c in ["ocr_v1", "ocr_pub"]:
             P = predict(te, c)
+            res[f"sanity_{c}"] = sanity(P, classes, f"test {c}")
             save(te, P, f"test_{c}")
     res["infer_min"] = round((time.time() - t1) / 60, 1)
+    json.dump(res, open(f"{out}/{tag}_result.json", "w"), indent=1)
+    on_save()
+    print(res, flush=True)
+    return res
+
+
+def predict_only(base, data_dir, out, adapter, tag, max_len=1024, bs=16, check_fold=-1, on_save=None):
+    """Load a saved LoRA adapter (+ score head) and write test probabilities for both OCR sources.
+    check_fold >= 0: first score that fold's validation rows (must reproduce the MAP@3 from training time for a fold
+    adapter). check_fold = -1: score 200 train rows instead (in-sample for a full-data adapter, so it must be high).
+    Either way a broken load is caught in the first minute, before the test set is predicted."""
+    from peft import PeftModel
+    from transformers import AutoModelForSequenceClassification
+
+    assert os.path.isdir(adapter), f"adapter not found: {adapter}"  # fail before the 16 GB base model is loaded
+    on_save = on_save or (lambda: None)
+    te = pd.read_csv(f"{data_dir}/text_test.csv")
+    tr = pd.read_csv(f"{data_dir}/text_train.csv")
+    classes = json.load(open(f"{data_dir}/classes.json"))
+    ci = {c: i for i, c in enumerate(classes)}
+    tok = load_tok(base)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        base, num_labels=len(classes), dtype=torch.bfloat16, device_map={"": 0}
+    )
+    model.config.pad_token_id = tok.pad_token_id
+    model.config.use_cache = False  # no KV cache: classification only
+    model = PeftModel.from_pretrained(model, adapter).eval()
+    t0 = time.time()
+    head = [p for n, p in model.named_parameters() if "score" in n and "modules_to_save" in n]
+    assert head and float(head[0].float().abs().sum()) > 0, "classification head was not restored from the adapter"
+    texts = lambda df, col: [build_text(r, _s(getattr(r, col))) for r in df.itertuples()]
+    chk = tr[tr.fold == check_fold] if check_fold >= 0 else tr.sample(200, random_state=0)
+    Pc = sum(predict_probs(model, tok, texts(chk, c), len(classes), max_len, bs) for c in ["ocr_v1", "ocr_pub"]) / 2
+    res = {
+        "tag": tag,
+        "rows": len(te),
+        "check_rows": len(chk),
+        "check_map3": round(map3(Pc, np.array([ci[c] for c in chk.root_code])), 4),
+    }
+    print("CHECK", res, flush=True)
+    assert res["check_map3"] > 0.5, "adapter scores too low on the check rows: wrong or broken adapter"
+    for col in ["ocr_v1", "ocr_pub"]:
+        P = predict_probs(model, tok, texts(te, col), len(classes), max_len, bs)
+        res[f"sanity_{col}"] = sanity(P, classes, f"test {col}")
+        d = pd.DataFrame(P.round(5), columns=classes)
+        d.insert(0, "trace_id", te.trace_id.values)
+        d.to_csv(f"{out}/{tag}_test_{col}.csv", index=False)
+        on_save()
+    res["infer_min"] = round((time.time() - t0) / 60, 1)
     json.dump(res, open(f"{out}/{tag}_result.json", "w"), indent=1)
     on_save()
     print(res, flush=True)

@@ -6,6 +6,7 @@
     vllm_run        GPU   vLLM inference with the merged model: transcription (the "reader") and direct diagnosis
     infer_vlm       GPU   the same diagnosis with transformers beam search (slower; kept for small holdouts)
     train_text      GPU   Qwen3-8B + LoRA + classification head on the transcribed text, one fold per call
+    predict_text    GPU   test-set inference from a saved text-classifier adapter
     pull / download       copy the small result files of a run to work/<run>/
 
 Usage:
@@ -388,6 +389,34 @@ def train_text(
             skip_test=skip_test,
             seed=seed,
             tag=tag,
+            on_save=MODEL_VOL.commit,
+        )
+    finally:
+        MODEL_VOL.commit()
+
+
+@app.function(image=gpu_image, gpu=GPU, volumes={"/models": MODEL_VOL}, timeout=2400, memory=32768)
+def predict_text(
+    run: str = "p2", adapter_tag: str = "fold0", base: str = "Qwen/Qwen3-8B", check_fold: int = 0, max_len: int = 1024
+):
+    """Test-set inference only, from a saved adapter (/models/runs/<run>/<adapter_tag>_adapter).
+    check_fold = the adapter's validation fold (its MAP@3 is re-measured first), or -1 for a full-data adapter
+    (adapter_tag is then 'fold-1'). Output files: <adapter_tag>_pred_test_{ocr_v1,ocr_pub}.csv."""
+    import sys
+
+    sys.path.insert(0, "/root/k12")
+    import text_cls
+
+    MODEL_VOL.reload()
+    try:
+        return text_cls.predict_only(
+            base=base,
+            data_dir="/root/k12/textdata",
+            out=f"/models/runs/{run}",
+            adapter=f"/models/runs/{run}/{adapter_tag}_adapter",
+            tag=f"{adapter_tag}_pred",
+            max_len=max_len,
+            check_fold=check_fold,
             on_save=MODEL_VOL.commit,
         )
     finally:
