@@ -16,6 +16,11 @@ Usage:
 
 The OCR directory holds ocr_train_<tag>.csv and ocr_test_<tag>.csv (columns trace_id, ocr).
 
+Pseudo-labelled rows (training side only, never evaluated on) are added with environment variables:
+    K12_PSEUDO       name of a set in scripts/modal/textdata/ (see prep_pseudo.py)
+    K12_PSEUDO_W     weight of a pseudo row in the priors (default 0.5)
+    K12_PSEUDO_COL   text column used for the pseudo rows (default ocr_v1)
+
 Writes work/cpu_{oof,test}_<tag>.npy, work/cpu_meta_<tag>.json and work/submission_cpu_<tag>.csv.
 """
 
@@ -28,7 +33,7 @@ import sys
 
 import numpy as np
 import pandas as pd
-from scipy.sparse import csr_matrix, hstack
+from scipy.sparse import csr_matrix, hstack, vstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
@@ -56,6 +61,24 @@ C2I = {c: i for i, c in enumerate(CLASSES)}
 K = len(CLASSES)
 y = train.root_code.map(C2I).values
 yt = train.root_code.values
+train["_w"] = 1.0
+
+# Optional pseudo-labelled rows from the unlabelled set (training side only, never evaluated on)
+PSEUDO = os.environ.get("K12_PSEUDO", "")
+PW = float(os.environ.get("K12_PSEUDO_W", 0.5))
+ps = None
+if PSEUDO:
+    ps = pd.read_csv(f"{ROOT}/scripts/modal/textdata/{PSEUDO}.csv")
+    ps = ps[ps.root_code.isin(C2I)].reset_index(drop=True)
+    ps["question_id"] = ps.trace_id.map(pd.read_csv(f"{D}/unlabelled.csv").set_index("trace_id").question_id)
+    ps["ocr"] = ps[os.environ.get("K12_PSEUDO_COL", "ocr_v1")].fillna("").astype(str)
+    ps["_w"] = PW
+    yps = ps.root_code.map(C2I).values
+    print(f"pseudo rows: {len(ps)} from {PSEUDO} (prior weight {PW})")
+
+
+def with_ps(df):
+    return pd.concat([df, ps], ignore_index=True) if ps is not None else df
 
 
 def map3(y_true, top3):
@@ -78,7 +101,8 @@ def top3(P):
 
 # ---------------- priors ----------------
 def fit_priors(df, a, b):
-    cnt = lambda d: np.bincount(d.root_code.map(C2I), minlength=K)
+    df = with_ps(df)
+    cnt = lambda d: np.bincount(d.root_code.map(C2I), weights=d._w, minlength=K)
     g = cnt(df) + 0.5
     g /= g.sum()
     topic, ques = {}, {}
@@ -246,11 +270,23 @@ def fit_predict_lr(Xtr, ytr, Xva, C=4.0):
 
 fit_txt = pd.concat([train._txt, test._txt])
 
-X_tr, X_te = build_X(fit_txt, [train._txt, test._txt], [A_tr, A_te], [train.grade.values, test.grade.values])
+if ps is not None:
+    ps["_txt"] = make_text(ps).fillna("").astype(str)
+    A_ps = np.array([answer_feats(t, k) for t, k in zip(ps.ocr, ps.correct_answer)], float)
+    X_tr, X_te, X_ps = build_X(
+        fit_txt,
+        [train._txt, test._txt, ps._txt],
+        [A_tr, A_te, A_ps],
+        [train.grade.values, test.grade.values, ps.grade.fillna(0).values],
+    )
+    plus = lambda X, yy: (vstack([X, X_ps]).tocsr(), np.concatenate([yy, yps]))
+else:
+    X_tr, X_te = build_X(fit_txt, [train._txt, test._txt], [A_tr, A_te], [train.grade.values, test.grade.values])
+    plus = lambda X, yy: (X, yy)
 oof_lr = np.zeros((len(train), K))
 for tr, va in FOLDS:
-    oof_lr[va] = fit_predict_lr(X_tr[tr], y[tr], X_tr[va])
-P_lr_te = fit_predict_lr(X_tr, y, X_te)
+    oof_lr[va] = fit_predict_lr(*plus(X_tr[tr], y[tr]), X_tr[va])
+P_lr_te = fit_predict_lr(*plus(X_tr, y), X_te)
 print(
     "CV MAP@3 LR text: %.4f | Q-prior: %.4f | topic: %.4f"
     % (map3(yt, top3(oof_lr)), map3(yt, top3(oof_q)), map3(yt, top3(oof_t)))
@@ -259,6 +295,7 @@ print(
 # ---------------- (question, answer) prior ----------------
 ans_tr = np.array([student_answer(t) for t in train.ocr])
 ans_te = np.array([student_answer(t) for t in test.ocr])
+ans_ps = np.array([student_answer(t) for t in ps.ocr]) if ps is not None else None
 
 
 def fit_qa(q_ids, ans, yy):
@@ -266,6 +303,10 @@ def fit_qa(q_ids, ans, yy):
     for q, a, c in zip(q_ids, ans, yy):
         if a:
             cnt.setdefault((q, a), np.zeros(K))[c] += 1
+    if ps is not None:
+        for q, a, c in zip(ps.question_id.values, ans_ps, yps):
+            if a:
+                cnt.setdefault((q, a), np.zeros(K))[c] += PW
     return cnt
 
 
