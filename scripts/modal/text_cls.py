@@ -2,7 +2,8 @@
 
 One call trains one fold (fold = -1 trains on all rows) and writes validation and test probabilities over the 76
 classes as CSV files for blending. Training rows show the reader's OCR, the public OCR or the human transcription at
-random, so the model learns from the same kind of noisy text it gets at test time.
+random, so the model learns from the same kind of noisy text it gets at test time. Training checkpoints every 100
+optimizer steps and resumes, because a preempted cloud GPU job is restarted from the beginning.
 """
 
 import json
@@ -187,7 +188,29 @@ def main(
     t0 = time.time()
     losses = []
     step = 0
+    # Modal can preempt a GPU container at any time and restarts the call from scratch: checkpoint and resume.
+    ck = f"{out}/{tag}_ckpt.pt"
+    k0 = 0
+    sig = [base, fold, epochs, lr, lora_r, batch, accum, max_len, seed, p_gold, p_pub, extra, len(trn), len(micro)]
+    if os.path.exists(ck):
+        try:
+            st = torch.load(ck, map_location="cpu", weights_only=False)
+            named = {n: p for n, p in model.named_parameters() if p.requires_grad}
+            assert st["sig"] == sig, "checkpoint belongs to a different run"
+            assert set(named) == set(st["params"]), "parameter names differ"
+            opt.load_state_dict(st["opt"])
+            sch.load_state_dict(st["sch"])
+            for n, p in named.items():
+                p.data.copy_(st["params"][n].to(p.device, p.dtype))
+            k0, step, losses = st["k"], st["step"], st["losses"]
+            print(f"RESUMED from checkpoint at step {step}/{n_steps}", flush=True)
+            del st
+        except Exception as e:
+            print("checkpoint not usable, starting fresh:", repr(e)[:300], flush=True)
+    step0 = step
     for k, idx in enumerate(micro):
+        if k < k0:
+            continue
         rows = [trn.iloc[i] for i in idx]
         enc = tok(
             [build_text(r, pick(r)) for r in rows],
@@ -210,11 +233,29 @@ def main(
             step += 1
             if step % 25 == 0 or step == n_steps:
                 el = time.time() - t0
-                sps = el / step
+                sps = el / max(1, step - step0)
                 print(
                     f"step {step}/{n_steps} loss {np.mean(losses[-25 * accum :]):.3f} {sps:.2f}s/step eta {(n_steps - step) * sps / 60:.1f} min",
                     flush=True,
                 )
+            if step % 100 == 0 or step == n_steps:  # the last one lets a restart during inference skip the training
+                try:
+                    torch.save(
+                        {
+                            "k": k + 1,
+                            "step": step,
+                            "losses": losses,
+                            "sig": sig,
+                            "opt": opt.state_dict(),
+                            "sch": sch.state_dict(),
+                            "params": {n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad},
+                        },
+                        ck + ".tmp",
+                    )
+                    os.replace(ck + ".tmp", ck)
+                    on_save()
+                except Exception as e:
+                    print("checkpoint save failed:", repr(e)[:300], flush=True)
     train_min = (time.time() - t0) / 60
     model.save_pretrained(f"{out}/{tag}_adapter")
     on_save()  # before inference, so an inference failure keeps the training
@@ -251,6 +292,8 @@ def main(
             save(te, P, f"test_{c}")
     res["infer_min"] = round((time.time() - t1) / 60, 1)
     json.dump(res, open(f"{out}/{tag}_result.json", "w"), indent=1)
+    if os.path.exists(ck):
+        os.remove(ck)  # finished: nothing left to resume
     on_save()
     print(res, flush=True)
     return res

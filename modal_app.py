@@ -19,7 +19,8 @@ Needs the Modal secret `huggingface` (HF_TOKEN of an account that accepted the d
 /models/runs/<run> on the volume `k12-models`. The folder scripts/modal/ is copied into the images at deploy time, so
 redeploy after changing code or scripts/modal/textdata/.
 
-Every function has a hard timeout.
+Every function has a hard timeout. GPU containers can be preempted, and Modal then restarts the call
+from the beginning; `train_text` checkpoints to the volume and resumes.
 
 Environment variables read at deploy time: K12_GPU (default A10G), K12_BASE_MODEL (the VLM), K12_TRAIN_TIMEOUT and
 K12_TEXT_TIMEOUT (seconds).
