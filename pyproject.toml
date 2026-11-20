@@ -1,0 +1,39 @@
+[project]
+name = "k12-misconception-detection"
+version = "1.0.0"
+description = "Diagnosing the root misconception in photos of K-12 students' handwritten maths working (Kaggle, MAP@3)."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "scipy>=1.13",
+    "scikit-learn>=1.5",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+cloud = ["modal>=1.0", "kaggle>=1.6"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",   # long lines: prompts and print statements are kept on one line
+    "E731",   # small lambdas are used as local helpers
+    "E741",   # `l` is used for "line" in the text-processing code
+    "B905",   # zip() without strict=: the inputs are aligned by construction
+    "UP031",  # a few prints format a result tuple with %
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["answer_match", "api_label", "common", "infer_lora", "text_cls", "train_lora", "vllm_infer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["scripts", "scripts/modal"]
